@@ -1,126 +1,167 @@
 import numpy as np
+import os
 from sentence_transformers import SentenceTransformer
-from sklearn.metrics.pairwise import cosine_similarity
+from .models import Book, UserBook
+from django.core.cache import cache
 from django.db.models import Q
-from .models import Book
 import logging
 
 logger = logging.getLogger(__name__)
 
-class SemanticSearchEngine:
-    def __init__(self):
-        self.model = None
-        self.book_embeddings = {}
-        self.books_data = []
-        self._load_model()
-        self._precompute_embeddings()
+# Global model variable
+_model = None
 
-    def _load_model(self):
-        """Load the Sentence-BERT model"""
+def get_sentence_transformer_model():
+    """Load and cache the Sentence-BERT model."""
+    global _model
+    if _model is None:
         try:
-            self.model = SentenceTransformer('all-MiniLM-L6-v2')
-            logger.info("Sentence-BERT model loaded successfully for semantic search")
+            # Use a smaller, efficient model for semantic search
+            _model = SentenceTransformer('all-MiniLM-L6-v2')
+            logger.info("Sentence-BERT model loaded successfully")
         except Exception as e:
             logger.error(f"Failed to load Sentence-BERT model: {e}")
-            self.model = None
+            return None
+    return _model
 
-    def _precompute_embeddings(self):
-        """Precompute embeddings for all books"""
-        if not self.model:
-            return
+def compute_semantic_embedding(text):
+    """Compute semantic embedding for a given text."""
+    model = get_sentence_transformer_model()
+    if model is None:
+        return None
 
-        try:
-            books = Book.objects.all()
-            self.books_data = list(books)
+    try:
+        # Clean and prepare text
+        text = str(text).strip()
+        if not text:
+            return None
 
-            if not self.books_data:
-                logger.warning("No books found for semantic search")
-                return
+        # Generate embedding
+        embedding = model.encode(text, convert_to_numpy=True)
+        return embedding.tolist()
+    except Exception as e:
+        logger.error(f"Error computing semantic embedding: {e}")
+        return None
 
-            # Create text representations for each book
-            book_texts = []
-            for book in self.books_data:
-                text = f"{book.title} {book.author} {book.description} {book.genre}"
-                book_texts.append(text)
+def cosine_similarity(a, b):
+    """Compute cosine similarity between two vectors."""
+    a = np.array(a)
+    b = np.array(b)
+    dot_product = np.dot(a, b)
+    norm_a = np.linalg.norm(a)
+    norm_b = np.linalg.norm(b)
+    return dot_product / (norm_a * norm_b) if norm_a != 0 and norm_b != 0 else 0
 
-            # Compute embeddings
-            embeddings = self.model.encode(book_texts, show_progress_bar=False)
-            self.book_embeddings = dict(zip([b.id for b in self.books_data], embeddings))
+def semantic_search_books(query, top_n=10):
+    """
+    Perform semantic search on books using Sentence-BERT embeddings.
 
-            logger.info(f"Precomputed embeddings for {len(self.books_data)} books")
+    Args:
+        query (str): The search query
+        top_n (int): Number of top results to return
 
-        except Exception as e:
-            logger.error(f"Error precomputing embeddings: {e}")
+    Returns:
+        list: List of (book, similarity_score) tuples
+    """
+    from django.core.cache import cache
+    import logging
+    logger = logging.getLogger(__name__)
 
-    def search(self, query, limit=20):
-        """Perform semantic search for the given query"""
-        if not self.model or not self.book_embeddings:
-            # Fallback to basic text search
-            return self._fallback_search(query, limit)
+    try:
+        # Check cache first
+        cache_key = f"semantic_search_{hash(query)}_{top_n}"
+        cached_results = cache.get(cache_key)
+        if cached_results:
+            return cached_results
 
-        try:
-            # Encode the query
-            query_embedding = self.model.encode([query])[0]
-
-            # Calculate similarities
-            similarities = {}
-            for book_id, book_embedding in self.book_embeddings.items():
-                similarity = cosine_similarity([query_embedding], [book_embedding])[0][0]
-                similarities[book_id] = similarity
-
-            # Sort by similarity and get top results
-            sorted_results = sorted(similarities.items(), key=lambda x: x[1], reverse=True)
-
-            results = []
-            for book_id, score in sorted_results[:limit]:
-                book = next((b for b in self.books_data if b.id == book_id), None)
-                if book:
-                    results.append({
-                        'book': book,
-                        'score': float(score),
-                        'relevance': self._get_relevance_label(score)
-                    })
-
-            return results
-
-        except Exception as e:
-            logger.error(f"Error performing semantic search: {e}")
-            return self._fallback_search(query, limit)
-
-    def _fallback_search(self, query, limit):
-        """Fallback to basic text search if semantic search fails"""
-        try:
-            books = Book.objects.filter(
-                Q(title__icontains=query) |
-                Q(author__icontains=query) |
-                Q(description__icontains=query) |
-                Q(genre__icontains=query)
-            )[:limit]
-
-            return [{
-                'book': book,
-                'score': 0.5,  # Default score for fallback
-                'relevance': 'text_match'
-            } for book in books]
-
-        except Exception as e:
-            logger.error(f"Error in fallback search: {e}")
+        # Compute query embedding
+        query_embedding = compute_semantic_embedding(query)
+        if query_embedding is None:
+            logger.warning("Could not compute embedding for query")
             return []
 
-    def _get_relevance_label(self, score):
-        """Get a human-readable relevance label based on similarity score"""
-        if score >= 0.8:
-            return 'highly_relevant'
-        elif score >= 0.6:
-            return 'relevant'
-        elif score >= 0.4:
-            return 'somewhat_relevant'
-        else:
-            return 'low_relevance'
+        # Get all books with semantic embeddings
+        books_with_embeddings = Book.objects.exclude(semantic_embedding__isnull=True).exclude(semantic_embedding__exact=[])
 
-    def refresh_embeddings(self):
-        """Refresh embeddings when books are added/updated"""
-        self._precompute_embeddings()
+        similarities = []
 
-# Global instance
-semantic_search_engine = SemanticSearchEngine()
+        for book in books_with_embeddings:
+            try:
+                book_embedding = book.semantic_embedding
+                if book_embedding:
+                    similarity = cosine_similarity(query_embedding, book_embedding)
+                    similarities.append((book, similarity))
+            except Exception as e:
+                logger.error(f"Error computing similarity for book {book.id}: {e}")
+                continue
+
+        # Also search UserBook model
+        user_books_with_embeddings = UserBook.objects.filter(is_available=True).exclude(semantic_embedding__isnull=True).exclude(semantic_embedding__exact=[])
+
+        for user_book in user_books_with_embeddings:
+            try:
+                book_embedding = user_book.semantic_embedding
+                if book_embedding:
+                    similarity = cosine_similarity(query_embedding, book_embedding)
+                    similarities.append((user_book, similarity))
+            except Exception as e:
+                logger.error(f"Error computing similarity for user_book {user_book.id}: {e}")
+                continue
+
+        # Sort by similarity (higher is better)
+        similarities.sort(key=lambda x: x[1], reverse=True)
+
+        # Cache results for 30 minutes
+        cache.set(cache_key, similarities[:top_n], 60 * 30)
+
+        logger.info(f"Semantic search found {len(similarities)} results for query: {query}")
+        return similarities[:top_n]
+
+    except Exception as e:
+        logger.error(f"Error in semantic search: {e}")
+        return []
+
+def precompute_book_embeddings():
+    """
+    Precompute semantic embeddings for all books that don't have them.
+    This should be run as a management command.
+    """
+    logger.info("Starting precomputation of semantic embeddings")
+
+    # Process Book model
+    books_without_embeddings = Book.objects.filter(
+        Q(semantic_embedding__isnull=True) | Q(semantic_embedding__exact=[])
+    )
+
+    updated_books = 0
+    for book in books_without_embeddings:
+        # Create a rich text representation for embedding
+        text_content = f"{book.title} {book.author} {book.genre} {book.category} {book.description}"
+        embedding = compute_semantic_embedding(text_content)
+
+        if embedding:
+            book.semantic_embedding = embedding
+            book.save()
+            updated_books += 1
+            logger.info(f"Computed embedding for book: {book.title}")
+
+    # Process UserBook model
+    user_books_without_embeddings = UserBook.objects.filter(
+        is_available=True
+    ).filter(
+        Q(semantic_embedding__isnull=True) | Q(semantic_embedding__exact=[])
+    )
+
+    updated_user_books = 0
+    for user_book in user_books_without_embeddings:
+        text_content = f"{user_book.title} {user_book.author} {user_book.genre} {user_book.category} {user_book.description}"
+        embedding = compute_semantic_embedding(text_content)
+
+        if embedding:
+            user_book.semantic_embedding = embedding
+            user_book.save()
+            updated_user_books += 1
+            logger.info(f"Computed embedding for user book: {user_book.title}")
+
+    logger.info(f"Precomputed embeddings for {updated_books} books and {updated_user_books} user books")
+    return updated_books, updated_user_books
